@@ -3,64 +3,46 @@ import random
 
 import discord
 import youtube_dl
+from discord import VoiceClient
+from discord.ext import commands
 from discord.ext.commands import Cog
 from discord.utils import get
 
 from config import TOKEN
-from utils import save_json, load_json
+from utils import save_json, load_json, get_yt_info
 
 try:
     from config import COMMAND_PREFIX
 except ImportError:
     COMMAND_PREFIX = "!"
-from discord.ext import commands
 
 bot = commands.Bot(command_prefix=COMMAND_PREFIX)
 
 playlists = load_json('playlists.json')
 
-current_playlist = list(playlists.keys())[0]
-current_channel = None
-
-
-class GuildState:
-    """Helper class managing per-guild state."""
-
-    def __init__(self):
-        self.volume = 1.0
-        self.playlist = []
-        self.skip_votes = set()
-        self.now_playing = None
-
-    def is_requester(self, user):
-        return self.now_playing.requested_by == user
-
 
 class Music(Cog):
-
     def __init__(self, _bot):
         self.bot = _bot
-        self.states = {}
-
-    def get_state(self, guild):
-        """Gets the state for `guild`, creating it if it does not exist."""
-        if guild.id in self.states:
-            return self.states[guild.id]
-        else:
-            self.states[guild.id] = GuildState()
-            return self.states[guild.id]
-
-    @commands.command()
-    async def ping(self, ctx):
-        await ctx.send('pong')
+        self.playlist = []
+        self.current_playlist = list(playlists.keys())[0]
+        self.current_channel = None
 
     @commands.command()
     async def add(self, ctx, playlist, link):
         if playlist not in playlists:
             playlists[playlist] = []
-        playlists[playlist].append(link)
+        info = get_yt_info(link)
+        if info['_type'] == 'playlist':
+            for song in info['entries']:
+                playlists[playlist].append(f"http://youtu.be/{song['url']}")
+            await ctx.send(f'Added YT playlist {info["title"]} to playlist {playlist}!')
+        else:
+            playlists[playlist].append(link)
+            if playlist == self.current_playlist:
+                self.playlist.append(link)
+            await ctx.send(f'Added song {info["title"]} to playlist {playlist}!')
         save_json(playlists, 'playlists.json')
-        await ctx.send('thanks')
 
     @commands.command()
     async def remove(self, ctx, playlist, link):
@@ -76,32 +58,47 @@ class Music(Cog):
         pl = playlists[playlist]
         embed = discord.Embed(title=f"Playlist {playlist}")
         for link in pl:
-            embed.add_field(name="Song", value=link, inline=True)
+            info = get_yt_info(link)
+            embed.add_field(name=info["title"], value=link, inline=True)
         await ctx.send(embed=embed)
 
     @commands.command()
     async def select(self, ctx, playlist):
-        global current_playlist
         if playlist in playlists:
-            current_playlist = playlist
+            self.current_playlist = playlist
             ctx.send(f"Successfully changed playlist to `{playlist}`!")
         else:
             ctx.send("Playlist does not exist!")
 
     @commands.command('channel')
     async def channel_(self, ctx):
-        global current_channel
-        current_channel = ctx.message.channel
-        await ctx.send(f"Current channel set to {current_channel.mention}!")
-
+        self.current_channel = ctx.message.channel
+        await ctx.send(f"Current channel set to {self.current_channel.mention}!")
 
     @commands.command()
-    async def queue(self, ctx, playlist=current_playlist):
+    async def queue(self, ctx, playlist=None):
+        if playlist is None:
+            playlist = self.current_playlist
+        # set the current playlist so we can loop
+        self.current_playlist = playlist
         plst = playlists[playlist]
-        while True:
-            random.shuffle(plst)
-            for song in plst:
-                await self.play_song(ctx.message, song)
+        random.shuffle(plst)
+        self.playlist = plst
+        voice = await self.get_voice_client(ctx.message)
+        self.play_song(voice, self.get_next_song())
+
+    @commands.command()
+    async def playlist(self, ctx, playlist=None):
+        if playlist in playlists:
+            self.current_playlist = playlist
+            ctx.send(f"Successfully set playlist to {playlist}!")
+        else:
+            ctx.send("Playlist does not exist!")
+
+    @commands.command()
+    async def skip(self, ctx):
+        voice = await self.get_voice_client(ctx.message)
+        voice.stop()
 
     @commands.command()
     async def stop(self, ctx):
@@ -118,18 +115,23 @@ class Music(Cog):
             voice = await message.author.voice.channel.connect()
         return voice
 
-    async def play_song(self, message: discord.Message, url, after=lambda: None):
-        channel = message.channel
+    def get_next_song(self):
+        if len(self.playlist) == 0:
+            self.playlist = playlists[self.current_playlist]
+            random.shuffle(self.playlist)
+        return self.playlist.pop(0)
+
+    def play_song(self, client: VoiceClient, url):
+        if not client.is_connected():
+            return
         song_there = os.path.isfile("song.mp3")
         try:
             if song_there:
                 os.remove("song.mp3")
         except PermissionError:
-            await channel.send("Wait for the current playing music end or use the 'stop' command")
+            print('error')
             return
-        await channel.send("Getting everything ready, playing audio soon")
         print("Someone wants to play music let me get that ready for them...")
-        voice = await Music.get_voice_client(message)
         ydl_opts = {
             'format': 'bestaudio/best',
             'postprocessors': [{
@@ -143,10 +145,14 @@ class Music(Cog):
         for file in os.listdir("./"):
             if file.endswith(".mp3"):
                 os.rename(file, 'song.mp3')
-        voice.play(discord.FFmpegPCMAudio("song.mp3"), after=after)
-        voice.volume = 100
-        while voice.is_playing():
-            pass
+
+        def after_playing(err):
+            song = self.get_next_song()
+            print(song, self.playlist)
+            self.play_song(client, song)
+
+        client.play(discord.FFmpegPCMAudio("song.mp3"), after=after_playing)
+        client.volume = 100
 
     @commands.command(pass_context=True, brief="This will play a song 'play [url]'", aliases=['pl'])
     async def play(self, ctx, url: str):
@@ -161,6 +167,7 @@ class Music(Cog):
     @staticmethod
     def get_url_from_playlist(playlist, idx):
         return playlist[idx]
+
 
 bot.add_cog(Music(bot))
 bot.run(TOKEN)
